@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: dyadlink
+    runtime: docker
+    plan: starter
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: DEEPSEEK_MODEL
+        value: deepseek-flash
+      - key: DYADLINK_DAILY_TOKEN_BUDGET
+        value: "500000"
+      - key: DYADLINK_GLOBAL_CALLS_PER_DAY
+        value: "5000"
+    disk:
+      name: dyadlink-data
+      mountPath: /tmp
+      sizeGB: 1

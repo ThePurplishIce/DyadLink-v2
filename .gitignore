@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.streamlit/secrets.toml
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+node_modules/
+.DS_Store
+Thumbs.db
+
+# Private planning docs — keep local, never push.
+MEGA_PLAN.md
+DyadLink_Proposal*.docx
