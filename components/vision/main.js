@@ -348,6 +348,7 @@ function createSession(root, parentElement, cfg, setStateValue) {
     inSpeech: false,
     speechTicks: 0,
     silenceTicks: 0,
+    bargeTicks: 0,
     speechStartSample: 0,
     awaitingReply: false,
     awaitingSince: 0,
@@ -714,7 +715,29 @@ function createSession(root, parentElement, cfg, setStateValue) {
       if (t - vad.awaitingSince > 45000) vad.awaitingReply = false;
       return;
     }
-    if (replyAudio && !replyAudio.paused) return;
+    if (replyAudio && !replyAudio.paused) {
+      // Barge-in: sustained loud speech while the reply plays interrupts
+      // it and falls through to normal VAD so the new utterance is caught.
+      // A higher threshold + 500ms hold guards against TTS echo through
+      // open speakers false-triggering an interrupt.
+      const bargeThr = Math.max(vad.noise * 4.0, 0.02);
+      if (rms != null && isFinite(rms) && rms > bargeThr) {
+        vad.bargeTicks = (vad.bargeTicks || 0) + 1;
+        if (vad.bargeTicks * TICK_MS >= 500) {
+          try {
+            replyAudio.pause();
+          } catch (err) {
+            /* ignore */
+          }
+          if (replyAudio._url) URL.revokeObjectURL(replyAudio._url);
+          replyAudio = null;
+          vad.bargeTicks = 0;
+        }
+      } else {
+        vad.bargeTicks = 0;
+      }
+      if (replyAudio && !replyAudio.paused) return;
+    }
     if (rms == null || !isFinite(rms)) return;
     const thr = Math.max(vad.noise * 3.0, 0.01);
     const loud = rms > thr;
@@ -740,7 +763,7 @@ function createSession(root, parentElement, cfg, setStateValue) {
     const speechMs = vad.speechTicks * TICK_MS;
     const silenceMs = vad.silenceTicks * TICK_MS;
     const durS = (pcmTotal - vad.speechStartSample) / audioCtx.sampleRate;
-    if ((silenceMs >= 900 && speechMs >= 350) || durS >= 15) {
+    if ((silenceMs >= 700 && speechMs >= 350) || durS >= 15) {
       emitUtterance();
     }
   }

@@ -77,3 +77,35 @@ def test_baseline_features_excludes_meta() -> None:
     assert "duration_s" not in features
     assert "frames" not in features
     assert all(isinstance(v, float) for v in features.values())
+
+
+def test_captures_restore_from_token_store() -> None:
+    """vision_captures must survive a refresh (new session state)."""
+    import streamlit as st
+    from modules import session_store
+    from modules.vision_session import sync_captures
+
+    token = "test-capture-restore"
+    session_store.clear_token(token)
+    capture = sanitize_capture(_payload(capture_id=99))
+    session_store.save_captures(token, [capture])
+    try:
+        # First "session": nothing in session state → restored from store.
+        st.session_state.clear()
+        st.session_state["_dl_token"] = token
+        sync_captures()
+        restored = st.session_state["vision_captures"]
+        assert len(restored) == 1
+        assert restored[0]["capture_id"] == 99
+        assert restored[0]["jaw_range"] == 0.42
+
+        # A new capture in the session is pushed back to the store.
+        st.session_state["vision_captures"].append(
+            sanitize_capture(_payload(capture_id=100))
+        )
+        sync_captures()
+        stored = session_store.get_captures(token)
+        assert [c["capture_id"] for c in stored] == [99, 100]
+    finally:
+        st.session_state.clear()
+        session_store.clear_token(token)

@@ -3,7 +3,7 @@ import streamlit as st
 from modules.browser_history import persist_token
 from modules.consent import render_consent_controls, render_required_consent
 from modules.i18n import render_language_selector, tr
-from modules.ui import render_global_styles
+from modules.ui import render_accessibility, render_global_styles
 
 
 st.set_page_config(
@@ -17,6 +17,7 @@ render_required_consent()
 persist_token()
 render_language_selector()
 render_consent_controls()
+render_accessibility()
 
 navigation = st.navigation(
     [

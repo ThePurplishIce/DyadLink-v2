@@ -80,6 +80,26 @@ def save_messages(token: str, messages: list[dict]) -> None:
         _save(store)
 
 
+_MAX_CAPTURES = 16
+
+
+def get_captures(token: str) -> list[dict]:
+    captures = get_record(token).get("captures")
+    return captures if isinstance(captures, list) else []
+
+
+def save_captures(token: str, captures: list[dict]) -> None:
+    """Persist sanitized capture dicts; keeps the most recent entries."""
+    if not token:
+        return
+    clean = [c for c in captures if isinstance(c, dict)]
+    with _LOCK:
+        store = _load()
+        record = store.setdefault(token, {})
+        record["captures"] = clean[-_MAX_CAPTURES:]
+        _save(store)
+
+
 _MAX_SAMPLES = 200
 _MAX_FEATURES_PER_SAMPLE = 24
 
@@ -109,6 +129,27 @@ def append_feature_sample(token: str, sample: dict) -> None:
             samples = []
         samples.append(clean)
         record["feature_samples"] = samples[-_MAX_SAMPLES:]
+        _save(store)
+
+
+def get_settings(token: str) -> dict:
+    settings = get_record(token).get("settings")
+    return settings if isinstance(settings, dict) else {}
+
+
+def save_settings(token: str, settings: dict) -> None:
+    """Persist small user preferences (e.g. accessibility options)."""
+    if not token or not isinstance(settings, dict):
+        return
+    clean = {
+        str(key)[:40]: value
+        for key, value in list(settings.items())[:20]
+        if isinstance(value, (str, int, float, bool)) or value is None
+    }
+    with _LOCK:
+        store = _load()
+        record = store.setdefault(token, {})
+        record["settings"] = clean
         _save(store)
 
 

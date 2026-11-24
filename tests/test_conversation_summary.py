@@ -6,8 +6,10 @@ from streamlit.testing.v1 import AppTest
 
 from modules.deepseek_service import (
     AssistantReply,
+    generate_greeting,
     generate_informant_summary,
     generate_reply,
+    generate_reply_stream,
     generate_summary,
 )
 
@@ -24,6 +26,99 @@ def _completion_response(url: str, content: str, total_tokens: int = 0) -> httpx
         },
         request=httpx.Request("POST", url),
     )
+
+
+class _FakeStream:
+    """Minimal stand-in for ``httpx.stream``'s response context manager."""
+
+    def __init__(self, lines: list[str], status_code: int = 200) -> None:
+        self._lines = lines
+        self.status_code = status_code
+
+    def __enter__(self) -> "_FakeStream":
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+    def iter_lines(self):
+        yield from self._lines
+
+    def read(self) -> None:
+        return None
+
+
+def test_reply_stream_yields_deltas_and_usage() -> None:
+    lines = [
+        'data: {"choices":[{"delta":{"content":"你好"}}]}',
+        'data: {"choices":[{"delta":{"content":"呀"}}],'
+        '"usage":{"total_tokens":42}}',
+        "data: [DONE]",
+    ]
+    meta: dict[str, int] = {}
+    messages = [{"role": "user", "content": "你好嗎"}]
+    request_bodies = []
+    original_stream = None
+
+    def fake_stream(method, url, **kwargs):
+        request_bodies.append(kwargs["json"])
+        return _FakeStream(lines)
+
+    with patch("modules.deepseek_service.httpx.stream", side_effect=fake_stream):
+        chunks = list(
+            generate_reply_stream(
+                "test-key", messages, user_turns=1, meta=meta
+            )
+        )
+
+    assert "".join(chunks) == "你好呀"
+    assert meta["total_tokens"] == 42
+    assert request_bodies[0]["stream"] is True
+    assert request_bodies[0]["stream_options"] == {"include_usage": True}
+
+
+def test_reply_stream_skips_ui_only_and_blocked() -> None:
+    captured = []
+
+    def fake_stream(method, url, **kwargs):
+        captured.append(kwargs["json"])
+        return _FakeStream(
+            ['data: {"choices":[{"delta":{"content":"ok"}}]}', "data: [DONE]"]
+        )
+
+    messages = [
+        {"role": "assistant", "content": "greeting", "ui_only": True},
+        {"role": "user", "content": "blocked", "scope_blocked": True},
+        {"role": "assistant", "content": "earlier"},
+        {"role": "user", "content": "hello"},
+    ]
+    with patch("modules.deepseek_service.httpx.stream", side_effect=fake_stream):
+        list(generate_reply_stream("test-key", messages, user_turns=1))
+
+    api_messages = captured[0]["messages"][1:]
+    contents = [m["content"] for m in api_messages]
+    assert "greeting" not in contents
+    assert "blocked" not in contents
+    assert contents[-1] == "hello"
+
+
+def test_generate_greeting_uses_recent_user_lines() -> None:
+    request_bodies = []
+
+    def fake_post(url: str, **kwargs: object) -> httpx.Response:
+        request_bodies.append(kwargs["json"])
+        return _completion_response(url, "歡迎返嚟！", 9)
+
+    messages = [
+        {"role": "assistant", "content": "How are you?", "mode": "deepseek"},
+        {"role": "user", "content": "我孫仔上星期嚟探我"},
+    ]
+    with patch("modules.deepseek_service.httpx.post", side_effect=fake_post):
+        greeting = generate_greeting("test-key", messages)
+
+    assert greeting == "歡迎返嚟！"
+    user_payload = request_bodies[0]["messages"][-1]["content"]
+    assert "我孫仔上星期嚟探我" in user_payload
 
 
 def test_deepseek_reply_continues_after_fifth_turn() -> None:
@@ -186,8 +281,8 @@ def test_informant_report_generates_automatically_at_fifth_turn() -> None:
     }
     with patch("modules.deepseek_service.get_api_key", return_value="test-key"):
         with patch(
-            "modules.deepseek_service.generate_reply",
-            return_value=AssistantReply("We can keep talking.", False, 5),
+            "modules.deepseek_service.generate_reply_stream",
+            side_effect=lambda *args, **kwargs: iter(["We can keep talking."]),
         ):
             with patch(
                 "modules.deepseek_service.generate_informant_summary",

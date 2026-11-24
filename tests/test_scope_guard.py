@@ -220,8 +220,8 @@ def test_blocked_turns_are_removed_from_chat_and_summary_requests() -> None:
 def test_app_blocks_wrapped_code_and_guards_model_output() -> None:
     with patch("modules.deepseek_service.get_api_key", return_value="test-key"):
         with patch(
-            "modules.deepseek_service.generate_reply",
-            return_value=AssistantReply("```python\nprint('unsafe')\n```", False, 10),
+            "modules.deepseek_service.generate_reply_stream",
+            return_value=iter(["```python\nprint('unsafe')\n```"]),
         ) as generate:
             with patch(
                 "modules.home.extract_memory_from_input",
@@ -276,7 +276,9 @@ def test_app_blocks_wrapped_code_and_guards_model_output() -> None:
 
 def test_medical_dose_request_gets_safety_message_without_model_answer() -> None:
     with patch("modules.deepseek_service.get_api_key", return_value="test-key"):
-        with patch("modules.deepseek_service.generate_reply") as generate:
+        with patch(
+            "modules.deepseek_service.generate_reply_stream"
+        ) as generate:
             with patch("modules.tts_service.synthesize_speech", return_value=b"mock-audio"):
                 app = AppTest.from_file(str(ROOT / "app.py")).run(timeout=20)
                 next(

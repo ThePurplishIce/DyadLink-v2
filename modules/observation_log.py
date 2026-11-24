@@ -4,9 +4,10 @@ from html import escape
 
 import streamlit as st
 
-from modules import baseline
+from modules import baseline, session_store
 from modules.browser_history import current_token
 from modules.i18n import tr
+from modules.text_features import merge_utterance_metrics
 
 
 DIMENSION_LABEL_KEYS = {
@@ -129,7 +130,18 @@ _TWO_DP = frozenset(
         "stillness_ratio",
         "speech_tempo_cv",
         "loudness_sd",
+        "ttr",
+        "content_ratio",
+        "pronoun_ratio",
+        "filler_ratio",
     }
+)
+_TEXT_FEATURES = (
+    "utterance_len",
+    "ttr",
+    "content_ratio",
+    "pronoun_ratio",
+    "filler_ratio",
 )
 # Signed metrics show a + sign so direction is readable at a glance.
 _SIGNED = frozenset({"drift_silence", "av_synchrony"})
@@ -212,6 +224,15 @@ def _format_report_text(report: dict[str, object]) -> str:
             ),
             tr("speech_pitch", sd=latest.get("f0_sd_st", 0)),
         ]
+    merged_text = merge_utterance_metrics(_textual_samples()[-12:])
+    if merged_text:
+        rows = [
+            f"- {tr(baseline.FEATURE_LABELS.get(feature, feature))}: {merged_text[feature]}"
+            for feature in _TEXT_FEATURES
+            if isinstance(merged_text.get(feature), (int, float))
+        ]
+        if rows:
+            lines += ["", f"## {tr('linguistic_title')}", *rows]
     captures = st.session_state.get("vision_captures") or []
     if captures:
         latest = captures[-1]
@@ -548,6 +569,95 @@ def _render_vision_metrics() -> None:
     )
 
 
+def _textual_samples() -> list[dict[str, float]]:
+    return [
+        message["textual"]
+        for message in st.session_state.get("chat_messages", [])
+        if message.get("role") == "user"
+        and isinstance(message.get("textual"), dict)
+    ]
+
+
+def _render_linguistic_metrics() -> None:
+    merged = merge_utterance_metrics(_textual_samples()[-12:])
+    if not merged:
+        return
+
+    st.markdown(f"**{tr('linguistic_title')}**")
+    st.caption(tr("linguistic_caption"))
+    token = current_token()
+    zmap = baseline.evaluate(token) if token else {}
+    cols = st.columns(3, gap="small")
+    flat = [
+        (feature, float(merged[feature]))
+        for feature in _TEXT_FEATURES
+        if isinstance(merged.get(feature), (int, float))
+    ]
+    flagged: list[str] = []
+    for index, (feature, value) in enumerate(flat):
+        zinfo = zmap.get(feature) or {}
+        if zinfo.get("level") in _LEVEL_STYLES and zinfo.get("z") is not None:
+            arrow = "↑" if zinfo["z"] > 0 else "↓"
+            flagged.append(
+                f"{tr(baseline.FEATURE_LABELS.get(feature, feature))} "
+                f"{arrow} z={zinfo['z']:+.1f}"
+            )
+        cols[index % 3].markdown(
+            _feature_card(feature, value, zinfo),
+            unsafe_allow_html=True,
+        )
+    if flagged:
+        st.caption(tr("vision_group_flags", items="、".join(flagged)))
+
+
+def _render_trends() -> None:
+    token = current_token()
+    if not token:
+        return
+    samples = session_store.get_feature_samples(token)
+    if not samples:
+        return
+    series: dict[str, list[tuple[float, float]]] = {}
+    for sample in samples:
+        ts = sample.get("ts")
+        if not isinstance(ts, (int, float)):
+            continue
+        for key, value in sample.items():
+            if key == "ts" or not isinstance(value, (int, float)):
+                continue
+            series.setdefault(key, []).append((float(ts), float(value)))
+    options = [key for key, points in series.items() if len(points) >= 2]
+    if not options:
+        st.caption(tr("trend_no_data"))
+        return
+
+    import plotly.graph_objects as go
+
+    st.markdown(f"**{tr('trend_title')}**")
+    pick = st.selectbox(
+        tr("trend_pick"),
+        options,
+        format_func=lambda feature: tr(
+            baseline.FEATURE_LABELS.get(feature, feature)
+        ),
+        key="trend_pick",
+    )
+    points = series[pick][-30:]
+    xs = [datetime.fromtimestamp(t).strftime("%m-%d %H:%M") for t, _ in points]
+    ys = [v for _, v in points]
+    fig = go.Figure(
+        go.Scatter(x=xs, y=ys, mode="lines+markers", line=dict(width=2))
+    )
+    fig.update_layout(
+        height=190,
+        margin=dict(l=10, r=10, t=12, b=10),
+        showlegend=False,
+        yaxis=dict(title=None),
+        xaxis=dict(title=None, tickangle=-30, tickfont=dict(size=10)),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
 def sensor_context_text() -> str:
     """Compact English digest of device-side metrics for the LLM report.
 
@@ -589,6 +699,19 @@ def sensor_context_text() -> str:
             lines.append(
                 f"Speech acoustics n={len(vocals)}: " + ", ".join(parts)
             )
+
+    textual = _textual_samples()
+    merged_text = merge_utterance_metrics(textual[-12:])
+    if merged_text:
+        parts = [
+            f"{key}={merged_text[key]}"
+            for key in _TEXT_FEATURES
+            if isinstance(merged_text.get(key), (int, float))
+        ]
+        lines.append(
+            f"Linguistic (per-utterance wording metrics, weighted mean over "
+            f"last {min(len(textual), 12)} utterances): " + ", ".join(parts)
+        )
 
     token = current_token()
     if token:
@@ -644,6 +767,10 @@ def render_observation_panel() -> None:
         _render_informant_report()
         _render_speech_metrics()
         _render_vision_metrics()
+        _render_linguistic_metrics()
+        with st.expander(tr("ecog_map_title")):
+            st.markdown(tr("ecog_map_body"))
+        _render_trends()
         _render_baseline()
         _render_ecog_radar()
         st.markdown(f"**{tr('observation_notes_title')}**")

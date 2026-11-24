@@ -54,6 +54,11 @@ FEATURE_LABELS = {
     "frown_ratio": "vision_frown_ratio",
     "gaze_down_ratio": "vision_gaze_down",
     "gaze_shift_rate": "vision_gaze_shift",
+    "utterance_len": "text_utterance_len",
+    "ttr": "text_ttr",
+    "content_ratio": "text_content_ratio",
+    "pronoun_ratio": "text_pronoun_ratio",
+    "filler_ratio": "text_filler_ratio",
 }
 
 # Features whose *decrease* is the clinically interesting direction get a

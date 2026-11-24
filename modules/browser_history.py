@@ -91,6 +91,8 @@ def _serialize_messages() -> list[dict[str, object]]:
             entry["speech_cpm"] = message["speech_cpm"]
         if isinstance(message.get("vocal"), dict):
             entry["vocal"] = message["vocal"]
+        if isinstance(message.get("textual"), dict):
+            entry["textual"] = message["textual"]
         entries.append(entry)
     return entries
 
@@ -118,6 +120,8 @@ def _restore_chat(entries: list[dict[str, object]]) -> None:
             message["speech_cpm"] = entry["speech_cpm"]
         if isinstance(entry.get("vocal"), dict):
             message["vocal"] = entry["vocal"]
+        if isinstance(entry.get("textual"), dict):
+            message["textual"] = entry["textual"]
         if entry.get("blocked"):
             message["scope_blocked"] = True
         if entry.get("ui_only"):

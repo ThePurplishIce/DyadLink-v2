@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import date
 from html import escape
 import time
 
@@ -14,8 +15,10 @@ from modules.consent import CONSENT_SESSION_KEY
 from modules.deepseek_service import (
     DeepSeekBudgetExceeded,
     DeepSeekServiceError,
+    generate_greeting,
     generate_informant_summary,
     generate_reply,
+    generate_reply_stream,
     get_api_key,
     transcribe_audio,
 )
@@ -37,9 +40,10 @@ from modules.observation_log import (
     sensor_context_text,
 )
 from modules.scope_guard import contains_disallowed_content, is_out_of_scope_request
+from modules.text_features import TRACKED_FEATURES, analyze_text
 from modules.ui import render_brand
 from modules.vision_component import mount_vision_observer
-from modules.vision_session import record_result
+from modules.vision_session import record_result, sync_captures
 from modules.tts_service import TTSError, autoplay_audio_html, synthesize_speech
 
 
@@ -146,14 +150,33 @@ def _record_observation(content: str) -> None:
         st.session_state.setdefault("auto_memory_log", []).append(note)
 
 
+def _attach_text_metrics(content: str) -> None:
+    features = analyze_text(content)
+    if not features:
+        return
+    st.session_state["chat_messages"][-1]["textual"] = features
+    token = current_token()
+    if token:
+        baseline.record_sample(
+            token,
+            {
+                key: value
+                for key, value in features.items()
+                if key in TRACKED_FEATURES
+            },
+        )
+
+
 def _append_user_message(
     content: str,
     api_key: str | None,
     live_enabled: bool,
+    defer_reply: bool = True,
 ) -> None:
     clean_content = content.strip()
     if not clean_content:
         return
+    st.session_state["session_had_input"] = True
 
     if detects_crisis(clean_content):
         st.session_state["crisis_flagged"] = True
@@ -225,12 +248,24 @@ def _append_user_message(
     )
     st.session_state["user_turns"] += 1
     user_turns = st.session_state["user_turns"]
+    _record_observation(clean_content)
+    _attach_text_metrics(clean_content)
 
     if is_emotionally_distressed(clean_content):
         st.session_state["empathy_turns_left"] = 3
     elif st.session_state["empathy_turns_left"] > 0:
         st.session_state["empathy_turns_left"] -= 1
     empathy_active = st.session_state["empathy_turns_left"] > 0
+
+    if live_enabled and api_key and defer_reply:
+        # Typed path: the reply streams during render so the user sees it
+        # type out; _complete_pending_reply finishes the turn.
+        st.session_state["pending_reply"] = {
+            "user_turns": user_turns,
+            "empathy": empathy_active,
+        }
+        st.session_state["chat_completed"] = False
+        return
 
     if live_enabled and api_key:
         try:
@@ -272,8 +307,92 @@ def _append_user_message(
         len(st.session_state["chat_messages"]) - 1
     )
     st.session_state["chat_completed"] = False
-    _record_observation(clean_content)
     _maybe_generate_informant_report(api_key, live_enabled, user_turns)
+
+
+def _complete_pending_reply(
+    container: "st.delta_generator.DeltaGenerator",
+    api_key: str | None,
+    live_enabled: bool,
+) -> None:
+    """Render + finish a deferred reply (``pending_reply`` session key)."""
+    pending = st.session_state.pop("pending_reply", None)
+    if not pending or not (live_enabled and api_key):
+        if pending:
+            # Consent/key vanished between submit and render — fall back.
+            reply = _mock_reply(pending["user_turns"])
+            st.session_state["chat_messages"].append(
+                {
+                    "role": "assistant",
+                    "content": reply,
+                    "mode": "local-demo",
+                    "speech_language": get_speech_language(),
+                }
+            )
+            st.session_state["tts_autoplay_pending"] = (
+                len(st.session_state["chat_messages"]) - 1
+            )
+        return
+
+    user_turns = pending["user_turns"]
+    meta: dict[str, int] = {}
+    pieces: list[str] = []
+
+    def _accumulate(stream):
+        for piece in stream:
+            pieces.append(piece)
+            yield piece
+
+    mode = "deepseek"
+    with container:
+        with st.chat_message("assistant"):
+            try:
+                stream = generate_reply_stream(
+                    api_key,
+                    st.session_state["chat_messages"],
+                    user_turns,
+                    response_language=get_response_language(),
+                    empathy=pending["empathy"],
+                    meta=meta,
+                )
+                st.write_stream(_accumulate(stream))
+            except DeepSeekBudgetExceeded:
+                st.session_state["input_error"] = tr("budget_fallback")
+                mode = "local-fallback"
+            except DeepSeekServiceError as error:
+                st.session_state["input_error"] = localize_service_error(
+                    str(error)
+                )
+                mode = "local-fallback"
+
+    reply = "".join(pieces).strip()
+    if mode == "local-fallback" and not reply:
+        reply = _mock_reply(user_turns)
+    if not reply:
+        st.session_state["input_error"] = tr("call_error")
+        reply = _mock_reply(user_turns)
+        mode = "local-fallback"
+    if mode == "deepseek" and contains_disallowed_content(reply):
+        # Streamed text can't be unshown, but it never reaches history.
+        reply = tr("scope_refusal")
+        mode = "scope-guard"
+    if isinstance(meta.get("total_tokens"), int):
+        st.session_state["deepseek_usage_tokens"] += meta["total_tokens"]
+
+    st.session_state["chat_messages"].append(
+        {
+            "role": "assistant",
+            "content": reply,
+            "mode": mode,
+            "speech_language": get_speech_language(),
+        }
+    )
+    st.session_state["tts_autoplay_pending"] = (
+        len(st.session_state["chat_messages"]) - 1
+    )
+    st.session_state["chat_completed"] = False
+    _maybe_generate_informant_report(api_key, live_enabled, user_turns)
+    st.rerun()
 
 
 def _generate_informant_report(
@@ -329,6 +448,70 @@ def _maybe_generate_informant_report(
     if st.session_state.get("informant_report_turn") == user_turns:
         return
     _generate_informant_report(api_key, live_enabled, user_turns, manual=False)
+
+
+def _maybe_greet(api_key: str | None, live_enabled: bool) -> None:
+    """One welcome-back greeting per session when prior history exists.
+
+    Only fires before the session's first input — a greeting appended
+    after a fresh turn would land below the user's own message.
+    """
+    if st.session_state.get("greeting_done"):
+        return
+    if st.session_state.get("session_had_input"):
+        st.session_state["greeting_done"] = True
+        return
+    messages = st.session_state["chat_messages"]
+    has_user = any(
+        message.get("role") == "user" and not message.get("scope_blocked")
+        for message in messages
+    )
+    if not has_user:
+        return
+    st.session_state["greeting_done"] = True
+    greeting = None
+    if live_enabled and api_key:
+        try:
+            greeting = generate_greeting(
+                api_key,
+                messages,
+                response_language=get_response_language(),
+            )
+        except DeepSeekServiceError:
+            greeting = None
+    if not greeting:
+        greeting = tr("greeting_fallback")
+    st.session_state["chat_messages"].append(
+        {
+            "role": "assistant",
+            "content": greeting,
+            "mode": "greeting",
+            "ui_only": True,
+            "speech_language": get_speech_language(),
+        }
+    )
+
+
+def _render_topic_card(api_key: str | None, live_enabled: bool) -> None:
+    """Rotating daily prompt for an empty conversation."""
+    if st.session_state["chat_messages"]:
+        return
+    topics = tr("daily_topics")
+    if not isinstance(topics, list) or not topics:
+        return
+    index = date.today().toordinal() % len(topics)
+    with st.container(border=True):
+        st.markdown(
+            f"**{escape(tr('topic_card_title'))}** — {escape(topics[index])}"
+        )
+        if st.button(
+            tr("topic_start"),
+            key="topic_card_start",
+            type="primary",
+            width="content",
+        ):
+            _append_user_message(topics[index], api_key, live_enabled)
+            st.rerun()
 
 
 def _render_conversation(api_key: str | None, live_enabled: bool) -> None:
@@ -391,6 +574,8 @@ def _render_conversation(api_key: str | None, live_enabled: bool) -> None:
                     st.caption(tr("local_badge"))
                 elif message.get("mode") == "vision-note":
                     st.caption(tr("vision_note_badge"))
+                elif message.get("mode") == "greeting":
+                    st.caption(tr("greeting_badge"))
                 _autoplay_assistant_message(message, message_index)
 
 
@@ -593,7 +778,11 @@ def _handle_call_utterance(
     except Exception:
         st.session_state.pop("pending_vocal", None)
 
-    _append_user_message(transcription.text, api_key, live_enabled)
+    # Call mode needs the reply synchronously (it feeds TTS right away),
+    # so this path skips the typed-chat streaming deferral.
+    _append_user_message(
+        transcription.text, api_key, live_enabled, defer_reply=False
+    )
     _attach_speech_metric(transcription.text, transcription.duration_ms)
 
     reply_message = st.session_state["chat_messages"][-1]
@@ -663,6 +852,11 @@ def _vision_dialog_body() -> None:
 def main() -> None:
     _initialize_state()
     sync_browser_history()
+    sync_captures()
+    api_key = get_api_key()
+    consent = bool(st.session_state.get(CONSENT_SESSION_KEY, False))
+    live_enabled = bool(api_key and consent)
+    _maybe_greet(api_key, live_enabled)
     render_brand(tr("home_brand"))
     st.markdown(_BOTTOM_BAR_CSS, unsafe_allow_html=True)
 
@@ -672,9 +866,6 @@ def main() -> None:
         f'<p class="conversation-copy">{tr("conversation_purpose")}</p>',
         unsafe_allow_html=True,
     )
-    api_key = get_api_key()
-    consent = bool(st.session_state.get(CONSENT_SESSION_KEY, False))
-    live_enabled = bool(api_key and consent)
     if not api_key:
         st.info(f"{tr('local_mode')} {tr('local_voice_off')}")
 
@@ -696,7 +887,10 @@ def main() -> None:
             unsafe_allow_html=True,
         )
 
-    _render_conversation(api_key, live_enabled)
+    conversation = st.container()
+    _render_topic_card(api_key, live_enabled)
+    with conversation:
+        _render_conversation(api_key, live_enabled)
     _render_transcript_review()
 
     if (
@@ -808,6 +1002,8 @@ def main() -> None:
     if submission and submission.strip():
         _append_user_message(submission, api_key, live_enabled)
         st.rerun()
+
+    _complete_pending_reply(conversation, api_key, live_enabled)
 
 
 if __name__ == "__main__":

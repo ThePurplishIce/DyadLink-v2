@@ -67,6 +67,8 @@ functional_impact 與 informant_concern_level 只是描述性標籤，供臨床�
 overall_impression、observation、recommendation_for_clinician 請使用{response_language}撰寫；domain 與枚舉值保持英文。
 若沒有足夠資訊，ecog_observations 可為空陣列。
 若訊息附上「裝置端觀察數值」，那是使用者鏡頭與麥克風在本機分析得出的匯總數字，按 Fluency（言語流暢）、Psychomotor（心理動作）、Affect（情感表達）、Alertness（警醒注意）四個範疇分組；可將有意義的變化寫成客觀觀察（例如停頓明顯增多可歸入 Communication），但數值不是診斷依據，不要過度推論。
+指標與 ECog 範疇的參考對應：Fluency ↔ Communication；Psychomotor ↔ Daily Activities／Personal Care；Alertness ↔ Communication 及整體參與；Affect 為情緒狀態補充背景（非 ECog 直接範疇）；Linguistic ↔ Communication。
+若訊息附上 Linguistic（語言內容）數值，那是對使用者逐句用字的整體統計（用字多樣性 ttr、實詞比例、代名詞比例、填充詞比例、句子長度）；同樣只作客觀觀察，不作診斷推論。
 """
 
 
@@ -466,36 +468,10 @@ def generate_reply(
     response_language: str = "Traditional Chinese",
     empathy: bool = False,
 ) -> AssistantReply:
-    if (
-        not messages
-        or messages[-1].get("role") != "user"
-        or messages[-1].get("scope_blocked")
-    ):
-        raise DeepSeekServiceError("對話狀態不完整，請重新開始。")
     _check_budget()
-
-    api_messages: list[dict[str, str]] = []
-    for message in messages:
-        if message.get("scope_blocked") or message.get("ui_only"):
-            continue
-        role = message.get("role")
-        content = message.get("content")
-        if role not in {"user", "assistant"} or not isinstance(content, str):
-            raise DeepSeekServiceError("對話狀態格式不正確，請重新開始。")
-        api_messages.append({"role": role, "content": content})
-
-    instruction = (
-        f"目前是第 {user_turns} 次使用者回答。對話不限次數；"
-        "除非使用者明確要求總結，否則繼續以一個簡短問題回應。"
-        f"請使用{response_language}回答。"
+    request_messages, model = _build_reply_request(
+        messages, user_turns, response_language, empathy
     )
-    if empathy:
-        instruction = f"{instruction}\n{EMPATHY_INSTRUCTION}"
-    request_messages = [
-        {"role": "system", "content": f"{SYSTEM_PROMPT}\n{instruction}"},
-        *api_messages,
-    ]
-    model = os.getenv("DEEPSEEK_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
     body = {
         "model": model,
         "messages": request_messages,
@@ -517,7 +493,14 @@ def generate_reply(
             response,
             "對話",
             body["model"],
-            (api_key, *(message["content"] for message in api_messages)),
+            (
+                api_key,
+                *(
+                    message["content"]
+                    for message in request_messages[1:]
+                    if isinstance(message.get("content"), str)
+                ),
+            ),
         )
         result = response.json()
     except DeepSeekServiceError:
@@ -541,6 +524,202 @@ def generate_reply(
         total_tokens = None
     _record_usage(total_tokens)
     return _parse_assistant_reply(raw_content, total_tokens)
+
+
+def _build_reply_request(
+    messages: list[dict[str, object]],
+    user_turns: int,
+    response_language: str,
+    empathy: bool,
+) -> tuple[list[dict[str, str]], str]:
+    if (
+        not messages
+        or messages[-1].get("role") != "user"
+        or messages[-1].get("scope_blocked")
+    ):
+        raise DeepSeekServiceError("對話狀態不完整，請重新開始。")
+
+    api_messages: list[dict[str, str]] = []
+    for message in messages:
+        if message.get("scope_blocked") or message.get("ui_only"):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            raise DeepSeekServiceError("對話狀態格式不正確，請重新開始。")
+        api_messages.append({"role": role, "content": content})
+
+    instruction = (
+        f"目前是第 {user_turns} 次使用者回答。對話不限次數；"
+        "除非使用者明確要求總結，否則繼續以一個簡短問題回應。"
+        f"請使用{response_language}回答。"
+    )
+    if empathy:
+        instruction = f"{instruction}\n{EMPATHY_INSTRUCTION}"
+    request_messages = [
+        {"role": "system", "content": f"{SYSTEM_PROMPT}\n{instruction}"},
+        *api_messages,
+    ]
+    model = os.getenv("DEEPSEEK_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    return request_messages, model
+
+
+def generate_reply_stream(
+    api_key: str,
+    messages: list[dict[str, object]],
+    user_turns: int,
+    response_language: str = "Traditional Chinese",
+    empathy: bool = False,
+    meta: dict[str, int] | None = None,
+):
+    """Streaming variant of ``generate_reply`` — yields content deltas.
+
+    ``meta`` (optional dict) receives ``total_tokens`` when the provider
+    reports usage in the final SSE chunk. Errors raise the same
+    ``DeepSeekServiceError``/``DeepSeekBudgetExceeded`` types; chunks yielded
+    before a mid-stream error should be treated as a partial reply.
+    """
+    _check_budget()
+    request_messages, model = _build_reply_request(
+        messages, user_turns, response_language, empathy
+    )
+    body = {
+        "model": model,
+        "messages": request_messages,
+        "temperature": 0.35,
+        "max_tokens": 320,
+        "response_format": {"type": "text"},
+        "thinking": {"type": "disabled"},
+        "safety_check": {"level": "high"},
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    api_contents = [
+        message["content"]
+        for message in request_messages[1:]
+        if isinstance(message.get("content"), str)
+    ]
+
+    try:
+        with httpx.stream(
+            "POST",
+            f"{BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=body,
+            timeout=httpx.Timeout(60.0, connect=10.0),
+        ) as response:
+            if response.status_code >= 400:
+                response.read()
+                _raise_for_response(
+                    response,
+                    "對話",
+                    model,
+                    (api_key, *api_contents),
+                )
+            total_tokens = None
+            for line in response.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(chunk, dict):
+                    continue
+                usage = chunk.get("usage")
+                if isinstance(usage, dict):
+                    tokens = usage.get("total_tokens")
+                    if type(tokens) is int and tokens >= 0:
+                        total_tokens = tokens
+                choices = chunk.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    continue
+                delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+                if isinstance(delta, dict):
+                    piece = delta.get("content")
+                    if isinstance(piece, str) and piece:
+                        yield piece
+    except DeepSeekServiceError:
+        raise
+    except httpx.TimeoutException:
+        raise DeepSeekServiceError("AI 回覆逾時，請稍後再試。") from None
+    except httpx.RequestError:
+        raise DeepSeekServiceError("目前無法連線至 AI 服務，請稍後再試。") from None
+
+    if meta is not None:
+        meta["total_tokens"] = total_tokens
+    _record_usage(total_tokens)
+
+
+def generate_greeting(
+    api_key: str,
+    messages: list[dict[str, object]],
+    response_language: str = "Traditional Chinese",
+) -> str:
+    """One-line welcome-back greeting referencing the restored history."""
+    user_snippets = [
+        str(message.get("content") or "").strip()
+        for message in messages
+        if message.get("role") == "user"
+        and not message.get("scope_blocked")
+        and not message.get("ui_only")
+        and str(message.get("content") or "").strip()
+    ]
+    if not user_snippets:
+        raise DeepSeekServiceError("沒有可問候的過往內容。")
+    _check_budget()
+
+    context_lines = "\n".join(f"- {snippet[:120]}" for snippet in user_snippets[-6:])
+    request_messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是尊重長者的日常對話助理。根據使用者上次聊過的內容，"
+                "寫一句自然的問候，像久未見面的晚輩打招呼；可以輕輕提一件"
+                "上次說過的事，但不要追問隱私、不要評論健康或能力。"
+                f"只輸出一句話，不超過 40 字，使用{response_language}。"
+            ),
+        },
+        {"role": "user", "content": f"使用者上次說過：\n{context_lines}"},
+    ]
+    model = os.getenv("DEEPSEEK_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    body = {
+        "model": model,
+        "messages": request_messages,
+        "temperature": 0.4,
+        "max_tokens": 80,
+        "response_format": {"type": "text"},
+        "thinking": {"type": "disabled"},
+        "safety_check": {"level": "high"},
+    }
+
+    try:
+        response = httpx.post(
+            f"{BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=body,
+            timeout=httpx.Timeout(30.0, connect=10.0),
+        )
+        _raise_for_response(response, "對話", model, (api_key, context_lines))
+        result = response.json()
+        raw = result["choices"][0]["message"]["content"]
+    except DeepSeekServiceError:
+        raise
+    except (httpx.RequestError, ValueError, KeyError, IndexError, TypeError):
+        raise DeepSeekServiceError("AI 問候生成失敗。") from None
+    if not isinstance(raw, str) or not raw.strip():
+        raise DeepSeekServiceError("AI 問候生成失敗。")
+
+    greeting = raw.strip().splitlines()[0].strip()
+    if len(greeting) > 120:
+        greeting = greeting[:119].rstrip() + "…"
+    usage = result.get("usage") if isinstance(result, dict) else None
+    total_tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
+    _record_usage(total_tokens if type(total_tokens) is int else 0)
+    return greeting
 
 
 def generate_summary(

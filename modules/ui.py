@@ -2,6 +2,12 @@ from html import escape
 
 import streamlit as st
 
+from modules import session_store
+from modules.browser_history import current_token
+from modules.i18n import tr
+
+_A11Y_SCALES = (1.0, 1.15, 1.3, 1.5)
+
 
 def render_global_styles() -> None:
     st.markdown(
@@ -212,11 +218,7 @@ def render_global_styles() -> None:
         }
 
         :root {
-            --drawer-w: min(380px, 92vw);
-        }
-
-        :root {
-            --drawer-w: min(380px, 92vw);
+            --drawer-w: min(570px, 92vw);
         }
 
         .st-key-obs_drawer_btn {
@@ -553,6 +555,92 @@ def render_global_styles() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def _a11y_state() -> dict:
+    a11y = st.session_state.get("a11y")
+    if isinstance(a11y, dict):
+        return a11y
+    a11y = {"font_scale": 1.0, "contrast": False}
+    token = current_token()
+    if token:
+        stored = session_store.get_settings(token)
+        if isinstance(stored.get("font_scale"), (int, float)):
+            stored_scale = float(stored["font_scale"])
+            a11y["font_scale"] = min(
+                _A11Y_SCALES, key=lambda s: abs(s - stored_scale)
+            )
+        a11y["contrast"] = bool(stored.get("contrast"))
+    st.session_state["a11y"] = a11y
+    return a11y
+
+
+def _save_a11y(a11y: dict) -> None:
+    token = current_token()
+    if token:
+        session_store.save_settings(token, a11y)
+
+
+def _bump_scale(step: int) -> None:
+    a11y = _a11y_state()
+    index = min(
+        range(len(_A11Y_SCALES)),
+        key=lambda i: abs(_A11Y_SCALES[i] - a11y["font_scale"]),
+    )
+    a11y["font_scale"] = _A11Y_SCALES[
+        max(0, min(len(_A11Y_SCALES) - 1, index + step))
+    ]
+    _save_a11y(a11y)
+
+
+def render_accessibility() -> None:
+    """Font-scale + high-contrast controls; persisted per visitor token."""
+    a11y = _a11y_state()
+    scale = a11y["font_scale"]
+
+    css = f"html {{ font-size: calc(16px * {scale}) !important; }}"
+    if a11y["contrast"]:
+        css += """
+        :root {
+            --ink: #000000 !important;
+            --muted: #222222 !important;
+            --line: #444444 !important;
+            --surface: #ffffff !important;
+            --blue: #003a70 !important;
+            --green: #005c4d !important;
+            --amber: #7a4a00 !important;
+        }
+        .stApp { background: #ffffff !important; }
+        """
+    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+
+    with st.sidebar:
+        st.caption(tr("a11y_title"))
+        smaller, larger, reset = st.columns(3)
+        if smaller.button(
+            tr("a11y_font_smaller"), key="a11y_down", width="stretch"
+        ):
+            _bump_scale(-1)
+            st.rerun()
+        if larger.button(
+            tr("a11y_font_larger"), key="a11y_up", width="stretch"
+        ):
+            _bump_scale(1)
+            st.rerun()
+        if reset.button(
+            tr("a11y_reset"), key="a11y_reset", width="stretch"
+        ):
+            a11y["font_scale"] = 1.0
+            a11y["contrast"] = False
+            _save_a11y(a11y)
+            st.rerun()
+        contrast = st.checkbox(
+            tr("a11y_contrast"), value=a11y["contrast"], key="a11y_contrast_box"
+        )
+        if contrast != a11y["contrast"]:
+            a11y["contrast"] = contrast
+            _save_a11y(a11y)
+            st.rerun()
 
 
 def render_brand(page_name: str) -> None:

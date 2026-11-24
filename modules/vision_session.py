@@ -12,13 +12,14 @@ from typing import Any
 
 import streamlit as st
 
-from modules import baseline
+from modules import baseline, session_store
 from modules.browser_history import current_token
 from modules.i18n import tr
 from modules.vision_features import baseline_features, sanitize_capture
 
 _MAX_CAPTURES = 8
 _MAX_NOTE_SCAN = 6
+_LOADED_KEY = "vision_captures_loaded"
 
 
 def _append_chat_note(cleaned: dict[str, Any]) -> None:
@@ -69,6 +70,7 @@ def record_result(res: Any) -> dict[str, Any] | None:
 
     token = current_token()
     if token:
+        session_store.save_captures(token, captures)
         features = baseline_features(cleaned)
         if features:
             baseline.record_sample(token, features)
@@ -80,3 +82,27 @@ def record_result(res: Any) -> dict[str, Any] | None:
 def latest_capture() -> dict[str, Any] | None:
     captures = st.session_state.get("vision_captures") or []
     return captures[-1] if captures else None
+
+
+def sync_captures() -> None:
+    """Persist captures into the token store; restore them once per session.
+
+    Call once per page run (home main). Captures are aggregate numbers only
+    — persisting them is consistent with the longitudinal personal baseline,
+    which already survives refresh by design.
+    """
+    token = current_token()
+    if not token:
+        return
+    captures = st.session_state.setdefault("vision_captures", [])
+    if not st.session_state.get(_LOADED_KEY):
+        st.session_state[_LOADED_KEY] = True
+        if not captures:
+            for item in session_store.get_captures(token):
+                cleaned = sanitize_capture(item)
+                if cleaned:
+                    captures.append(cleaned)
+            del captures[:-_MAX_CAPTURES]
+            return
+    if session_store.get_captures(token) != captures[-_MAX_CAPTURES:]:
+        session_store.save_captures(token, captures[-_MAX_CAPTURES:])
